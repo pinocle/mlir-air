@@ -1,5 +1,21 @@
 # MLIR-AIR
 
+This fork's `aie1-project-fixes` branch contains the companion aie-compiler's
+AIE1 extensions, based on upstream `29e358645c94acd1fcc6de28e2f29811514b7399`.
+Project implementation files carry a `_fix` suffix:
+
+- `python/aiec_air/*_fix.py`: scheduling, memory planning, AIR lowering,
+  program grouping/projection and host-control lowering. Install the separate
+  `aie-compiler-air-fixes` package with `pip install -e python`; it uses the
+  companion project's `compiler` APIs and does not replace the native `air` package.
+- `mlir/lib/Transform/AIECFixes/*_fix.cpp` and
+  `mlir/include/air/AIECFixes/Passes_fix.td`: AIE1 extension passes. The companion
+  project's CMake includes this directory and links `AIECAIRFixes` into `aiec-opt`.
+- `mlir/test/AIECFixes/*_fix.mlir`: extension regressions, run by the companion
+  project's `check-aiec` target alongside its remaining frontend/device tests.
+
+The upstream AIR sources and the installed native wheel version are unchanged.
+
 **An MLIR-based compiler for spatial accelerators. One architecture-independent
 representation of hierarchical compute and asynchronous data movement, lowered
 to AMD™ NPUs and GPUs.**
