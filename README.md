@@ -1,6 +1,6 @@
 # MLIR-AIR
 
-This fork's `aie1-project-fixes` branch, based on upstream
+This fork's `main` branch, based on upstream
 `29e358645c94acd1fcc6de28e2f29811514b7399`, compiles AIE1 (Versal AI Core,
 `xcvc1902`) like an NPU: `aircc --device=xcvc1902` lowers host control to an
 `aie.runtime_sequence` (`air-to-std`, `airrt-to-npu`) and, with the mlir-aie
