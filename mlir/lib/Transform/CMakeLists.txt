@@ -38,14 +38,23 @@ if(AIR_ENABLE_AIE)
   )
 endif()
 list(APPEND TRANSFORM_SOURCES
+  AIRBindLaunch.cpp
+  AIREliminateStagingBuffers.cpp
+  AIRLocalizeAccumulators.cpp
   AIRMiscPasses.cpp
   AIRRegularizeLoopPass.cpp
   AIRSplitLaunchForPadding.cpp
   AIRTilingUtils.cpp
   AIRTransformInterpreter.cpp
   AIRVerifyHierarchyLocality.cpp
+  AIRReadOnlyArguments.cpp
   AffineLoopOptPass.cpp
+  CopyCanonicalizationPass.cpp
+  DecomposeTensorConcatPass.cpp
+  EraseUnusedLinalgOperands.cpp
+  LinalgGeneralizePass.cpp
   Passes.cpp
+  ReduceContractionRankPass.cpp
   ReturnEliminationPass.cpp
 )
 
@@ -56,6 +65,8 @@ set(TRANSFORM_LINK_LIBS
   MLIRIR
   MLIRLinalgTransforms
   MLIRLinalgUtils
+  MLIRBufferizationDialect
+  MLIRTensorTransforms
   MLIRSupport
 )
 

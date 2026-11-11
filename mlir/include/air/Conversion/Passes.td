@@ -448,7 +448,12 @@ def AIRRtToNpu : Pass<"airrt-to-npu", "ModuleOp"> {
           "transfer, reducing the number of host-issued DMA task "
           "configure/start/await triplets. Opt-in: this reorders a channel's "
           "paced feeds ahead of the sibling-channel interleave, so enable it "
-          "only for feeds verified numerically equivalent when coalesced.">
+          "only for feeds verified numerically equivalent when coalesced.">,
+    Option<"clShimBurstLength", "shim-burst-length", "unsigned",
+          /*default=*/"0",
+          "AXI burst length in bytes of every runtime-sequence shim BD (0: the "
+          "target's default). Set it to what the platform's NoC endpoints "
+          "were configured for (e.g. a Versal base platform's GMIO burst).">
   ];
   let dependentDialects = ["xilinx::AIEX::AIEXDialect",
                            "mlir::affine::AffineDialect"];

@@ -1,4 +1,0 @@
-config.aiec_binary_dir = "@CMAKE_BINARY_DIR@"
-config.aiec_tools_dir = "@CMAKE_BINARY_DIR@/bin"
-config.llvm_tools_dir = "@LLVM_TOOLS_BINARY_DIR@"
-lit_config.load_config(config, "@AIEC_AIR_SOURCE@/test/AIECFixes/lit.cfg.py")

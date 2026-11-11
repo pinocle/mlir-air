@@ -2716,7 +2716,128 @@ LogicalResult enforceAIE2StrideLimit(ModuleOp module) {
   return success();
 }
 
+// Whether a transfer is one contiguous run, as a one-dimensional shim BD
+// (limits.dims == 1, AIE1) moves it: no repeat dimension (zero stride) either,
+// since such a target has no repeat count.
+static bool isSingleContiguousRun(ArrayRef<int64_t> sizes,
+                                  ArrayRef<int64_t> strides) {
+  int64_t expected = 1;
+  for (size_t i = sizes.size(); i-- > 0;) {
+    if (sizes[i] == 1)
+      continue;
+    if (strides[i] != expected)
+      return false;
+    expected *= sizes[i];
+  }
+  return true;
+}
+
+// Split a transfer for a target whose shim BDs are one-dimensional (AIE1) into
+// contiguous runs in access order: the innermost contiguous dimensions merge
+// into one run, every other dimension (zero-stride repeats included) becomes
+// pieces. Lengths and strides must be constant; offsets may be runtime values.
+static LogicalResult splitIntoContiguousRuns(airrt::DmaMemcpyNdOp transfer,
+                                             unsigned maxPieces) {
+  auto sizes = getConstantIntValues(transfer.getMixedLengths());
+  auto strides = getConstantIntValues(transfer.getMixedStrides());
+  if (!sizes || !strides)
+    return transfer.emitOpError(
+        "needs constant lengths and strides on a target with "
+        "one-dimensional shim buffer descriptors");
+  if (isSingleContiguousRun(*sizes, *strides))
+    return success();
+  OpBuilder builder(transfer);
+  Location loc = transfer.getLoc();
+  SmallVector<OpFoldResult> offsets = transfer.getMixedOffsets();
+  int64_t base = 0;
+  Value dynamicBase;
+  for (size_t d = 0; d < offsets.size(); ++d) {
+    if (auto c = getConstantIntValue(offsets[d])) {
+      base += *c * (*strides)[d];
+      continue;
+    }
+    if ((*strides)[d] == 0)
+      continue;
+    Value term = cast<Value>(offsets[d]);
+    if ((*strides)[d] != 1)
+      term = arith::MulIOp::create(
+          builder, loc, term,
+          arith::ConstantOp::create(builder, loc,
+                                    builder.getI64IntegerAttr((*strides)[d])));
+    dynamicBase =
+        dynamicBase
+            ? arith::AddIOp::create(builder, loc, dynamicBase, term).getResult()
+            : term;
+  }
+  // (size, stride) innermost first; merge the contiguous innermost dims.
+  SmallVector<std::pair<int64_t, int64_t>> dims;
+  for (size_t d = sizes->size(); d-- > 0;)
+    dims.push_back({(*sizes)[d], (*strides)[d]});
+  int64_t run = 1;
+  size_t outer = 0;
+  while (outer < dims.size() &&
+         (dims[outer].first == 1 || dims[outer].second == run)) {
+    run *= dims[outer].first;
+    ++outer;
+  }
+  int64_t count = 1;
+  for (size_t d = outer; d < dims.size(); ++d)
+    count *= dims[d].first;
+  if (count > static_cast<int64_t>(maxPieces))
+    return transfer.emitOpError("splits into ")
+           << count << " contiguous transfers (more than " << maxPieces << ")";
+  auto attr = [&](int64_t v) -> OpFoldResult {
+    return builder.getI64IntegerAttr(v);
+  };
+  SmallVector<OpFoldResult> lengths{attr(1), attr(1), attr(1), attr(run)};
+  SmallVector<OpFoldResult> unit{attr(0), attr(0), attr(0), attr(1)};
+  SmallVector<airrt::DmaMemcpyNdOp> pieces;
+  SmallVector<int64_t> index(dims.size() - outer, 0);
+  for (int64_t n = 0; n < count; ++n) {
+    int64_t start = base;
+    for (size_t d = 0; d < index.size(); ++d)
+      start += index[d] * dims[outer + d].second;
+    OpFoldResult first = attr(start);
+    if (dynamicBase)
+      first = start ? arith::AddIOp::create(
+                          builder, loc, dynamicBase,
+                          arith::ConstantOp::create(
+                              builder, loc, builder.getI64IntegerAttr(start)))
+                          .getResult()
+                    : dynamicBase;
+    SmallVector<OpFoldResult> at{attr(0), attr(0), attr(0), first};
+    auto piece = airrt::DmaMemcpyNdOp::create(
+        builder, loc, transfer->getResultTypes(), transfer.getId(),
+        transfer.getX(), transfer.getY(), transfer.getMemref(), at, lengths,
+        unit);
+    for (NamedAttribute named : transfer->getDiscardableAttrs())
+      piece->setAttr(named.getName(), named.getValue());
+    pieces.push_back(piece);
+    for (size_t d = 0; d < index.size(); ++d) {
+      if (++index[d] < dims[outer + d].first)
+        break;
+      index[d] = 0;
+    }
+  }
+  replaceTransferEvent(transfer, pieces);
+  transfer.erase();
+  return success();
+}
+
 LogicalResult enforceAIE2WrapLimit(ModuleOp module) {
+  // A target whose shim BDs are one-dimensional (AIE1) moves only contiguous
+  // runs: split every other transfer instead of tiling wraps.
+  if (air::getDmaBdLimits(module, air::MemorySpace::L3).dims == 1) {
+    SmallVector<airrt::DmaMemcpyNdOp> transfers;
+    module.walk([&](func::FuncOp f) {
+      f.walk([&](airrt::DmaMemcpyNdOp dma) { transfers.push_back(dma); });
+    });
+    for (auto transfer : transfers)
+      if (failed(splitIntoContiguousRuns(transfer, /*maxPieces=*/4096)))
+        return failure();
+    return success();
+  }
+
   // Identify airrt.dma_memcpy_nd ops that violate the AIE2 wrap size
   // constraint.
   SmallVector<airrt::DmaMemcpyNdOp> target_airrt_dmas;
@@ -3388,6 +3509,18 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
       device->removeAttr(kMultiIterLaunchAttr);
       device->removeAttr(kNumLaunchItersAttr);
     });
+
+    // The shim BDs' AXI burst, when the platform fixes it.
+    if (clShimBurstLength) {
+      auto burst =
+          IntegerAttr::get(IntegerType::get(module.getContext(), 32),
+                           static_cast<int64_t>(clShimBurstLength));
+      module.walk([&](xilinx::AIE::RuntimeSequenceOp sequence) {
+        sequence.walk([&](xilinx::AIE::DMABDOp bd) {
+          bd->setAttr(bd.getBurstLengthAttrName(), burst);
+        });
+      });
+    }
   }
 
   // Whether two buffer descriptors touch a common element of their buffer;

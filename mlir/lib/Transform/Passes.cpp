@@ -58,5 +58,12 @@ void xilinx::air::registerTransformPasses() {
   registerAIRTransformInterpreterPass();
   registerAIRUnrollOuterPerfectlyNestedLoopsPass();
   registerAIRVerifyHierarchyLocality();
+  registerAIRBindLaunch();
+  registerAIRReadOnlyArguments();
+  registerCopyCanonicalization();
+  registerDecomposeTensorConcat();
+  registerEraseUnusedLinalgOperands();
+  registerLinalgGeneralize();
+  registerReduceContractionRankPass();
 }
 #endif

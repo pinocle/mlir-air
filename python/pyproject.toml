@@ -5,11 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aie-compiler-air-fixes"
 version = "0.1.0"
-description = "AIE1 project extensions to the pinned MLIR-AIR compiler"
+description = "Companion-project helpers next to the MLIR-AIR compiler"
 requires-python = ">=3.12"
-dependencies = ["mlir-air==0.0.1.2026101304+29e3586"]
+# The air package itself is the fork's source build (tools/build_upstream.py, env.sh).
+dependencies = []
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aiec_air", "aiec_air.*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"aiec_air.triton" = ["transform_library/*.mlir"]

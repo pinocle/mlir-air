@@ -857,6 +857,74 @@ def AIRDependency : Pass<"air-dependency", "ModuleOp"> {
   }];
 }
 
+def AIREliminateStagingBuffers : Pass<"air-eliminate-staging-buffers", "ModuleOp"> {
+  let summary = "Let herds move data from L3 directly where a buffer only stages it";
+  let constructor = "xilinx::air::createAIREliminateStagingBuffersPass()";
+  let description = [{
+    The Triton-XDNA transform scripts keep a program's whole block in an L2
+    buffer: triton-shared loads into an allocation, flatten_tile_forall
+    allocates the result in memory space 1, and each core's DMAs move its part
+    between that buffer and L1. A target without L2 memory (AIE1) cannot place
+    those buffers.
+
+    After the transform script (bufferized, herds formed, before
+    air-wrap-func-with-parallel), an allocation outside herds that only
+    stages data is removed:
+      - written by one memref.copy from a non-allocation source and read only
+        by herds whose tied argument is a DMA source: the herds take the
+        source;
+      - written only by herds through DMA destinations and read by one
+        memref.copy to a non-allocation destination after them: the herds take
+        the destination, whose view ops are moved before the first herd.
+    Operations between the copy and the herds must not write memory other than
+    allocations (and, for outputs, not read the destination). Ported from
+    hexagon-mlir IntermediateBufferEliminationPattern (CopyCanonicalizationPass).
+
+    The staging buffer was a snapshot of the whole block. Without it, a core
+    reads its input when it runs, so two pointer arguments to overlapping
+    memory are only correct when each core reads what it alone writes.
+  }];
+  let dependentDialects = ["xilinx::air::airDialect", "mlir::memref::MemRefDialect"];
+}
+
+def AIRAnnotateUniformInit : Pass<"air-annotate-uniform-init", "ModuleOp"> {
+  let summary = "Mark Linalg outputs whose whole buffer holds a proven constant";
+  let constructor = "xilinx::air::createAIRAnnotateUniformInitPass()";
+  let description = [{
+    A conservative reaching-definition analysis over each function's
+    top-level operations: a linalg.fill of a whole buffer with an
+    arith.constant, possibly copied whole into another non-parameter buffer,
+    reaches a Linalg operation whose output region argument is read. That
+    operation gets air.uniform_output_init (one FloatAttr or unit per output)
+    for air-localize-accumulators. Any other Linalg write, unknown operation,
+    call or control flow kills every fact, and a copy into a function
+    parameter kills all of them (parameters may alias). Existing annotations
+    from the input are removed first.
+  }];
+  let dependentDialects = ["mlir::linalg::LinalgDialect"];
+}
+
+def AIRLocalizeAccumulators : Pass<"air-localize-accumulators", "ModuleOp"> {
+  let summary = "Initialize promoted reduction outputs in local memory from proven uniform values";
+  let constructor = "xilinx::air::createAIRLocalizeAccumulatorsPass()";
+  let description = [{
+    Runs after air-linalg-codegen with L1 promotion. An operation carrying
+    air.uniform_output_init (air-annotate-uniform-init) has its promoted L1
+    output loaded by one memref.copy and stored by another. The load becomes a
+    linalg.fill of the proven constant, so no input DMA brings the initial
+    value: a core tile with two input DMA channels (AIE1) can then run a
+    reduction over two operands. Before that, the copy pair is hoisted out of
+    enclosing static positive scf.for loops that do not produce the output
+    view and have no other access to it (as HoistReduceBufferPattern, for
+    synchronous copies). A loop that still encloses the load must vary the
+    output tile, or the fill would reset a partial sum; anything else is an
+    error. Afterwards a whole-buffer host fill whose only readers were the
+    localized loads is erased.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::linalg::LinalgDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect"];
+}
+
 def AIRHoistDmaInAccumPattern: Pass<"air-hoist-dma-in-accum-pattern", "ModuleOp"> {
   let summary = "Hoist pairs of DMA ops out of for loop based on dependency graph";
   let constructor = "xilinx::air::createAIRHoistDmaInAccumPattern()";
@@ -1899,5 +1967,94 @@ def AIRMergeUnrolledDevices : Pass<"air-merge-unrolled-devices", "ModuleOp"> {
   }];
 }
 
+
+//===----------------------------------------------------------------------===//
+// Front-end normalization (before air-linalg-codegen)
+//===----------------------------------------------------------------------===//
+
+def AIRBindLaunch : Pass<"air-bind-launch", "ModuleOp"> {
+  let summary = "Bind one Triton launch into a triton-shared kernel's signature";
+  let description = [{
+    triton-shared emits a kernel as one program: the kernel's unranked
+    memref pointers and runtime scalars in source order, then num_programs
+    x/y/z and program_id x/y/z. Once air-wrap-func-with-parallel has made the
+    body a loop over the grid (so the program ids are unused), this pass
+    gives the function the PyTorch path's form for one launch:
+
+    * each pointer becomes memref<sizes[i] x T>, sizes[i] being the elements
+      the launch buffer spans, cast back to the unranked type where the body
+      uses it;
+    * each scalar becomes an arith.constant of its value (`scalars`, decimal
+      text parsed by the argument's integer or float type);
+    * num_programs becomes constants of `grid`;
+    * the scalar and grid arguments are removed.
+
+    The bound kernel is valid only for that launch. Not from a base
+    repository: triton-shared, Triton-XDNA and hexagon-mlir keep these as
+    runtime arguments.
+  }];
+  let constructor = "xilinx::air::createAIRBindLaunchPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::memref::MemRefDialect"];
+  let options = [
+    ListOption<"sizes", "sizes", "int64_t", "Element count of each pointer argument's buffer">,
+    ListOption<"scalars", "scalars", "std::string", "Value of each scalar argument, in order">,
+    ListOption<"grid", "grid", "int64_t", "Launch grid x,y,z">,
+  ];
+}
+
+def AIRReadOnlyArguments : Pass<"air-read-only-arguments", "ModuleOp"> {
+  let summary = "Mark function tensor arguments as not writable for bufferization";
+  let description = [{
+    A function's tensor arguments are its inputs, which a caller keeps. With
+    bufferize-function-boundaries and without copy-before-write,
+    one-shot-bufferize treats function arguments as writable and may compute
+    an op whose outs is an argument (outs(%arg0)) in that argument's buffer.
+    Each tensor argument of a defined function gets
+    bufferization.writable = false, so bufferization copies it before such a
+    write. Torch-MLIR's RefBackend and mlir-air avoid the write with
+    copy-before-write, which also copies every other write.
+  }];
+  let constructor = "xilinx::air::createAIRReadOnlyArgumentsPass()";
+  let dependentDialects = ["mlir::bufferization::BufferizationDialect"];
+}
+
+def CopyCanonicalization :
+    Pass<"copy-canonicalization", "func::FuncOp"> {
+  let summary = "Eliminate intermediate buffer allocations in copy chains";
+  let description = [{
+    Canonicalizes memory copy operations by eliminating intermediate
+    allocations that serve as passthroughs in write-once, read-many patterns.
+  }];
+  let constructor =
+       "xilinx::air::createCopyCanonicalizationPass()";
+}
+
+def DecomposeTensorConcat : Pass<"triton-decompose-tensor-concat", "func::FuncOp"> {
+  let summary = "Convert tensor.concat to other tensor ops";
+  let constructor = "xilinx::air::createDecomposeTensorConcatPass()";
+}
+
+def EraseUnusedLinalgOperands :
+     Pass<"erase-unused-linalg-operands", "mlir::ModuleOp"> {
+   let summary = "Erase unused linalg operand and remove dead code.";
+   let constructor = "xilinx::air::createEraseUnusedLinalgOperands()";
+}
+
+def LinalgGeneralize :
+    InterfacePass<"linalg-generalize", "mlir::FunctionOpInterface"> {
+  let summary = "Pass to lower linalg named op to generic.";
+
+  let constructor =
+       "xilinx::air::createLinalgGeneralizePass()";
+}
+
+def ReduceContractionRankPass :
+  Pass<"reduce-contraction-rank", "mlir::func::FuncOp"> {
+  let summary = "Reduce rank of named contraction ops with unit dims";
+  let description = [{
+    Converts batch_matmul with batch=1 to matmul, and matvec with unit dims to dot.
+  }];
+  let constructor = "xilinx::air::createReduceContractionRankPass()";
+}
 
 #endif // AIR_CONVERSION_PASSES

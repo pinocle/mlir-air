@@ -1,20 +1,37 @@
 # MLIR-AIR
 
-This fork's `aie1-project-fixes` branch contains the companion aie-compiler's
-AIE1 extensions, based on upstream `29e358645c94acd1fcc6de28e2f29811514b7399`.
-Project implementation files carry a `_fix` suffix:
+This fork's `aie1-project-fixes` branch, based on upstream
+`29e358645c94acd1fcc6de28e2f29811514b7399`, compiles AIE1 (Versal AI Core,
+`xcvc1902`) like an NPU: `aircc --device=xcvc1902` lowers host control to an
+`aie.runtime_sequence` (`air-to-std`, `airrt-to-npu`) and, with the mlir-aie
+fork (`pinocle/mlir-aie` main, the companion project's `third_party/mlir-aie`), emits
+`--output-format=xaie`: per-device libxaie configuration, Chess core ELFs and
+the sequence's instruction stream, which the companion project's board runtime
+replays. The AIE1 changes:
 
-- `python/aiec_air/*_fix.py`: scheduling, memory planning, AIR lowering,
-  program grouping/projection and host-control lowering. Install the separate
-  `aie-compiler-air-fixes` package with `pip install -e python`; it uses the
-  companion project's `compiler` APIs and does not replace the native `air` package.
-- `mlir/lib/Transform/AIECFixes/*_fix.cpp` and
-  `mlir/include/air/AIECFixes/Passes_fix.td`: AIE1 extension passes. The companion
-  project's CMake includes this directory and links `AIECAIRFixes` into `aiec-opt`.
-- `mlir/test/AIECFixes/*_fix.mlir`: extension regressions, run by the companion
-  project's `check-aiec` target alongside its remaining frontend/device tests.
+- `tools/aircc/aircc.cpp`: the AIE1 device branch (ObjectFIFO lowering, no
+  memtile or ping-pong passes, Chess, `xaie` output, runtime BD reclaim); the
+  Versal host-library path and its options are removed, as upstream #2156.
+- `air-to-std`: the VCK190 control-loop serialization is removed, as upstream
+  #2160.
+- `air-opt-shim-dma-bds`: AIE1 launches end in the `air.launch_end` wait.
+- `airrt-to-npu`: transfers for one-dimensional shim BDs are split into
+  contiguous runs.
+- `air-annotate-uniform-init`, `air-localize-accumulators`
+  (`mlir/lib/Transform/AIRLocalizeAccumulators.cpp`): a reduction's
+  accumulator is initialized in local memory, as an AIE1 core tile has two
+  input DMA channels.
+- `air-eliminate-staging-buffers`: L2 staging buffers (no memory tile on
+  AIE1) are removed from Triton-XDNA's tiling.
+- Front-end normalization before tiling (`AIRFrontendPasses.h`):
+  hexagon-mlir's `linalg-generalize`, `reduce-contraction-rank`,
+  `erase-unused-linalg-operands`, `triton-decompose-tensor-concat`,
+  `copy-canonicalization`, and `air-bind-launch`, `air-read-only-arguments`.
 
-The upstream AIR sources and the installed native wheel version are unchanged.
+`python/aiec_air` keeps the companion project's Triton plugin, VCK190
+platform contract and tool locations. The companion project builds this fork
+and the mlir-aie fork from source (`tools/build_upstream.py`) and uses them
+through `env.sh`; no AIR or AIE wheel is installed.
 
 **An MLIR-based compiler for spatial accelerators. One architecture-independent
 representation of hierarchical compute and asynchronous data movement, lowered

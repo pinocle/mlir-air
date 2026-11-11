@@ -7921,8 +7921,27 @@ public:
     // dma for AIE1 does not optimize the schedule.
     if (isa<AIE::AIE1TargetModel>(AIE::getTargetModel(*device))) {
       // AIE1 has no multi-dimensional DMA at shim. No need to tile. Apply dma
-      // folding and finish.
+      // folding, then end the function body and every async launch with the
+      // blocking air.launch_end wait the tiled path ends them with below
+      // (nothing is tiled): airrt-to-npu turns the drains it gathers into the
+      // runtime sequence's awaits.
       applyAIRL3DmaFoldingPatterns(func, *device);
+      SmallVector<Block *> blocks{&func.getBody().front()};
+      func.walk([&](air::LaunchOp launch) {
+        if (air::isAsyncOp(launch))
+          blocks.push_back(&launch.getRegion().front());
+      });
+      OpBuilder builder(ctx);
+      for (Block *blk : blocks) {
+        if (llvm::any_of(blk->getOps<air::WaitAllOp>(), [](air::WaitAllOp w) {
+              return w->hasAttr("air.launch_end");
+            }))
+          continue;
+        OpBuilder::InsertionGuard guard(builder);
+        auto launchEndWaitAll = air::generateWaitAllToTerminateBlock(
+            *blk, builder, /*isBlocking=*/true);
+        launchEndWaitAll->setAttr("air.launch_end", builder.getUnitAttr());
+      }
       return;
     }
 

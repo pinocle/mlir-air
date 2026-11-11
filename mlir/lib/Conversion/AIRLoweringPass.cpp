@@ -1816,29 +1816,6 @@ public:
         [](Operation &op) { return isa<airrt::WaitAllOp, scf::YieldOp>(op); },
         /*requireSegmentUnrollCond=*/true);
 
-    // If scf parallel loops containing memcpy ops exist in the same scope as
-    // herd load, then attempt to serialize the asynchronous control programs.
-    // Note: This is a workaround for vck190 having a single control processor.
-    // Skip this for NPU targets which use XRT and don't have this limitation.
-    bool hasNPUDevice = false;
-    module.walk([&](AIE::DeviceOp device) {
-      if (device.getTargetModel().hasProperty(AIE::AIETargetModel::IsNPU))
-        hasNPUDevice = true;
-    });
-
-    if (!hasNPUDevice) {
-      module.walk([&](func::FuncOp f) {
-        bool hasCandidateSCFParallel = false;
-        for (auto par : f.getBody().getOps<scf::ParallelOp>()) {
-          par.walk(
-              [&](airrt::DmaMemcpyNdOp c) { hasCandidateSCFParallel = true; });
-        }
-        if (hasCandidateSCFParallel)
-          if (failed(serializeAsyncControlFlows(f)))
-            signalPassFailure();
-      });
-    }
-
     module.walk([&](func::FuncOp f) {
       // SCF parallel to affine for conversion
       if (failed(ScfParToAffineForConversion(f))) {
@@ -1958,104 +1935,6 @@ private:
     Operation *output = nullptr;
     op.walk([&](airrt::DmaMemcpyNdOp o) { output = o; });
     return output;
-  }
-
-  // This function is a workaround for vck190 having one single control
-  // processor, where all the async. control programs are serialized here.
-  LogicalResult serializeAsyncControlFlows(func::FuncOp func) const {
-
-    // Collect async scf loops in line-by-line order
-    std::vector<Operation *> scf_loops;
-    for (auto scf_loop : func.getBody().getOps<scf::ForOp>()) {
-      if (getInnerMostMemcpyFromLoopNest(scf_loop)) {
-        scf_loops.push_back(scf_loop);
-      }
-    }
-    for (auto scf_loop : func.getBody().getOps<scf::ParallelOp>()) {
-      if (getInnerMostMemcpyFromLoopNest(scf_loop)) {
-        scf_loops.push_back(scf_loop);
-      }
-    }
-
-    // Adjacent loops which contain for loop should merge into one
-    std::vector<std::vector<Operation *>> scf_loop_buckets;
-    scf_loop_buckets.push_back(std::vector<Operation *>());
-    int bucket_id = 0;
-    bool prev_loop_in_bucket = false;
-    for (auto scf_loop : scf_loops) {
-      bool merge_candidate_loop = false;
-      if (isa<scf::ForOp>(scf_loop))
-        merge_candidate_loop = true;
-      else if (auto scf_par = dyn_cast_if_present<scf::ParallelOp>(scf_loop)) {
-        merge_candidate_loop = false;
-        for (auto child_scf_for_loop :
-             scf_par.getBody()->getOps<scf::ForOp>()) {
-          (void)child_scf_for_loop;
-          merge_candidate_loop = true;
-        }
-      }
-
-      if (merge_candidate_loop) {
-        scf_loop_buckets[bucket_id].push_back(scf_loop);
-        prev_loop_in_bucket = true;
-      } else {
-        if (prev_loop_in_bucket == true) {
-          bucket_id++;
-          scf_loop_buckets.push_back(std::vector<Operation *>());
-        }
-        prev_loop_in_bucket = false;
-      }
-    }
-
-    // Merge each bucket of loops into one
-    for (auto bucket : scf_loop_buckets) {
-      if (!bucket.empty()) {
-        OpBuilder builder(bucket[0]);
-        auto new_ctrl_loop = builder.clone(*bucket[0]);
-        Operation *first_chan_op =
-            getInnerMostMemcpyFromLoopNest(new_ctrl_loop);
-        auto dst_loop_nest = getParentLoopNest(first_chan_op, new_ctrl_loop);
-        for (unsigned i = 1; i < bucket.size(); i++) {
-          IRMapping remap;
-          Operation *chan_op = getInnerMostMemcpyFromLoopNest(bucket[i]);
-          if (!chan_op) {
-            func->emitOpError("memcpy in innermost loop body not found.");
-            return failure();
-          }
-          auto src_loop_nest = getParentLoopNest(chan_op, bucket[i]);
-          for (auto [src_loop, dst_loop] :
-               llvm::zip_equal(src_loop_nest, dst_loop_nest)) {
-            remapLoop(src_loop, dst_loop, remap);
-          }
-          auto yield_op = dst_loop_nest[0]
-                              ->getRegions()
-                              .front()
-                              .getBlocks()
-                              .front()
-                              .getTerminator();
-          builder.setInsertionPoint(yield_op);
-          remapOpAndOperands(builder, chan_op, remap);
-          if (i == bucket.size() - 1) {
-            SmallVector<Value, 8> operands{};
-            if (auto new_ctrl_loop_par =
-                    dyn_cast_if_present<scf::ParallelOp>(dst_loop_nest[0])) {
-              if (!new_ctrl_loop_par.getInitVals().empty())
-                operands.push_back(new_ctrl_loop_par.getInitVals()[0]);
-            } else if (auto new_ctrl_loop_for =
-                           dyn_cast_if_present<scf::ForOp>(dst_loop_nest[0])) {
-              if (!new_ctrl_loop_for.getRegionIterArgs().empty())
-                operands.push_back(new_ctrl_loop_for.getRegionIterArgs()[0]);
-            }
-            scf::YieldOp::create(builder, yield_op->getLoc(), operands);
-            yield_op->erase();
-          }
-        }
-      }
-      for (unsigned i = 0; i < bucket.size(); i++) {
-        bucket[i]->erase();
-      }
-    }
-    return success();
   }
 };
 
